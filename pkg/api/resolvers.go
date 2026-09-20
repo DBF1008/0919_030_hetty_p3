@@ -251,7 +251,7 @@ func regexpToStringPtr(r *regexp.Regexp) *string {
 }
 
 func (r *mutationResolver) CloseProject(ctx context.Context) (*CloseProjectResult, error) {
-	if err := r.ProjectService.CloseProject(); err != nil {
+	if err := r.ProjectService.CloseProject(ctx); err != nil {
 		return nil, fmt.Errorf("could not close project: %w", err)
 	}
 

@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/oklog/ulid"
@@ -15,6 +16,7 @@ import (
 	"github.com/dstotijn/hetty/pkg/filter"
 	"github.com/dstotijn/hetty/pkg/reqlog"
 	"github.com/dstotijn/hetty/pkg/scope"
+	"github.com/dstotijn/hetty/pkg/syncutil"
 )
 
 //nolint:gosec
@@ -28,15 +30,20 @@ var defaultHTTPClient = &http.Client{
 var (
 	ErrProjectIDMustBeSet = errors.New("sender: project ID must be set")
 	ErrRequestNotFound    = errors.New("sender: request not found")
+	ErrServiceClosing     = errors.New("sender: service is closing")
 )
 
 type Service struct {
+	mu              sync.RWMutex
 	activeProjectID ulid.ULID
 	findReqsFilter  FindRequestsFilter
-	scope           *scope.Scope
-	repo            Repository
-	reqLogSvc       *reqlog.Service
-	httpClient      *http.Client
+
+	inflight *syncutil.InFlight
+
+	scope      *scope.Scope
+	repo       Repository
+	reqLogSvc  *reqlog.Service
+	httpClient *http.Client
 }
 
 type FindRequestsFilter struct {
@@ -61,6 +68,7 @@ func NewService(cfg Config) *Service {
 		repo:       cfg.Repository,
 		reqLogSvc:  cfg.ReqLogService,
 		httpClient: defaultHTTPClient,
+		inflight:   syncutil.NewInFlight(),
 		scope:      cfg.Scope,
 	}
 
@@ -86,7 +94,11 @@ type Request struct {
 }
 
 func (svc *Service) FindRequestByID(ctx context.Context, id ulid.ULID) (Request, error) {
-	req, err := svc.repo.FindSenderRequestByID(ctx, svc.activeProjectID, id)
+	svc.mu.RLock()
+	projectID := svc.activeProjectID
+	svc.mu.RUnlock()
+
+	req, err := svc.repo.FindSenderRequestByID(ctx, projectID, id)
 	if err != nil {
 		return Request{}, fmt.Errorf("sender: failed to find request: %w", err)
 	}
@@ -95,11 +107,24 @@ func (svc *Service) FindRequestByID(ctx context.Context, id ulid.ULID) (Request,
 }
 
 func (svc *Service) FindRequests(ctx context.Context) ([]Request, error) {
-	return svc.repo.FindSenderRequests(ctx, svc.findReqsFilter, svc.scope)
+	svc.mu.RLock()
+	filter := svc.findReqsFilter
+	svc.mu.RUnlock()
+
+	return svc.repo.FindSenderRequests(ctx, filter, svc.scope)
 }
 
 func (svc *Service) CreateOrUpdateRequest(ctx context.Context, req Request) (Request, error) {
-	if svc.activeProjectID.Compare(ulid.ULID{}) == 0 {
+	if !svc.inflight.Begin() {
+		return Request{}, ErrServiceClosing
+	}
+	defer svc.inflight.Done()
+
+	svc.mu.RLock()
+	activeProjectID := svc.activeProjectID
+	svc.mu.RUnlock()
+
+	if activeProjectID.Compare(ulid.ULID{}) == 0 {
 		return Request{}, ErrProjectIDMustBeSet
 	}
 
@@ -107,7 +132,7 @@ func (svc *Service) CreateOrUpdateRequest(ctx context.Context, req Request) (Req
 		req.ID = ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
 	}
 
-	req.ProjectID = svc.activeProjectID
+	req.ProjectID = activeProjectID
 
 	if req.Method == "" {
 		req.Method = http.MethodGet
@@ -130,7 +155,16 @@ func (svc *Service) CreateOrUpdateRequest(ctx context.Context, req Request) (Req
 }
 
 func (svc *Service) CloneFromRequestLog(ctx context.Context, reqLogID ulid.ULID) (Request, error) {
-	if svc.activeProjectID.Compare(ulid.ULID{}) == 0 {
+	if !svc.inflight.Begin() {
+		return Request{}, ErrServiceClosing
+	}
+	defer svc.inflight.Done()
+
+	svc.mu.RLock()
+	activeProjectID := svc.activeProjectID
+	svc.mu.RUnlock()
+
+	if activeProjectID.Compare(ulid.ULID{}) == 0 {
 		return Request{}, ErrProjectIDMustBeSet
 	}
 
@@ -141,7 +175,7 @@ func (svc *Service) CloneFromRequestLog(ctx context.Context, reqLogID ulid.ULID)
 
 	req := Request{
 		ID:                 ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy),
-		ProjectID:          svc.activeProjectID,
+		ProjectID:          activeProjectID,
 		SourceRequestLogID: reqLogID,
 		Method:             reqLog.Method,
 		URL:                reqLog.URL,
@@ -159,15 +193,30 @@ func (svc *Service) CloneFromRequestLog(ctx context.Context, reqLogID ulid.ULID)
 }
 
 func (svc *Service) SetFindReqsFilter(filter FindRequestsFilter) {
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
 	svc.findReqsFilter = filter
 }
 
 func (svc *Service) FindReqsFilter() FindRequestsFilter {
+	svc.mu.RLock()
+	defer svc.mu.RUnlock()
+
 	return svc.findReqsFilter
 }
 
 func (svc *Service) SendRequest(ctx context.Context, id ulid.ULID) (Request, error) {
-	req, err := svc.repo.FindSenderRequestByID(ctx, svc.activeProjectID, id)
+	if !svc.inflight.Begin() {
+		return Request{}, ErrServiceClosing
+	}
+	defer svc.inflight.Done()
+
+	svc.mu.RLock()
+	activeProjectID := svc.activeProjectID
+	svc.mu.RUnlock()
+
+	req, err := svc.repo.FindSenderRequestByID(ctx, activeProjectID, id)
 	if err != nil {
 		return Request{}, fmt.Errorf("sender: failed to find request: %w", err)
 	}
@@ -225,7 +274,33 @@ func (svc *Service) sendHTTPRequest(httpReq *http.Request) (reqlog.ResponseLog, 
 }
 
 func (svc *Service) SetActiveProjectID(id ulid.ULID) {
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
 	svc.activeProjectID = id
+}
+
+func (svc *Service) ActiveProjectID() ulid.ULID {
+	svc.mu.RLock()
+	defer svc.mu.RUnlock()
+
+	return svc.activeProjectID
+}
+
+// BeginDrain rejects new sender requests while a project is being closed.
+func (svc *Service) BeginDrain() {
+	svc.inflight.BeginDrain()
+}
+
+// Wait blocks until all in-flight sender requests have finished.
+func (svc *Service) Wait() {
+	svc.inflight.Wait()
+}
+
+// WaitFor waits for all in-flight sender requests to finish, or until stop is
+// closed. It returns true when all work has finished.
+func (svc *Service) WaitFor(stop <-chan struct{}) bool {
+	return svc.inflight.WaitFor(stop)
 }
 
 func (svc *Service) DeleteRequests(ctx context.Context, projectID ulid.ULID) error {

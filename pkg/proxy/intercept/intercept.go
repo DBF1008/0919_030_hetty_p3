@@ -26,6 +26,19 @@ type contextKey int
 
 const interceptResponseKey contextKey = 0
 
+// abortHookKey stores an optional func on a request context that is invoked
+// synchronously when interception aborts the request (either because it was
+// explicitly cancelled or because interception was disabled while the request
+// was queued). It lets outer middleware release resources immediately instead
+// of waiting for request context cancellation to propagate.
+const abortHookKey contextKey = 1
+
+// WithAbortHook registers a hook that is invoked when interception aborts the
+// request carrying ctx.
+func WithAbortHook(ctx context.Context, hook func()) context.Context {
+	return context.WithValue(ctx, abortHookKey, hook)
+}
+
 // Request represents a server received HTTP request, alongside a channel for sending a modified version of it to the
 // routine that's awaiting it. Also contains a channel for receiving a cancellation signal.
 type Request struct {
@@ -48,8 +61,17 @@ type Item struct {
 }
 
 type Service struct {
-	reqMu     *sync.RWMutex
-	resMu     *sync.RWMutex
+	reqMu *sync.RWMutex
+	resMu *sync.RWMutex
+	// setMu guards the interception settings (requestsEnabled,
+	// responsesEnabled, reqFilter and resFilter). It is held in shared mode
+	// while an incoming request/response is checked against the settings and
+	// registered in the queue, and exclusively while settings are updated.
+	// Together with the queue locks this guarantees disabling interception
+	// also clears every item that was accepted under the old settings. The
+	// lock must be released before blocking on an intercepted item's channel.
+	setMu sync.RWMutex
+
 	requests  map[ulid.ULID]Request
 	responses map[ulid.ULID]Response
 	logger    log.Logger
@@ -101,6 +123,11 @@ func (svc *Service) RequestModifier(next proxy.RequestModifyFunc) proxy.RequestM
 		switch {
 		case errors.Is(err, ErrRequestAborted):
 			svc.logger.Debugw("Stopping intercept, request was aborted.")
+
+			if hook, ok := req.Context().Value(abortHookKey).(func()); ok {
+				hook()
+			}
+
 			// Prevent further processing by replacing req.Context with a cancelled context value.
 			// This will cause the http.Roundtripper in the `proxy` package to
 			// handle this request as an error.
@@ -129,36 +156,62 @@ func (svc *Service) InterceptRequest(ctx context.Context, req *http.Request) (*h
 		return req, nil
 	}
 
-	if !svc.requestsEnabled {
-		// If request intercept is disabled, return the incoming request as-is.
-		svc.logger.Debugw("Bypassed request interception: feature disabled.")
-		return req, nil
-	}
-
-	if svc.reqFilter != nil {
-		match, err := MatchRequestFilter(req, svc.reqFilter)
-		if err != nil {
-			return nil, fmt.Errorf("intercept: failed to match request rules for request (id: %v): %w",
-				reqID.String(), err,
-			)
-		}
-
-		if !match {
-			svc.logger.Debugw("Bypassed request interception: request rules don't match.")
-			return req, nil
-		}
-	}
-
+	// Check the settings and register the request in the queue atomically:
+	// holding setMu (shared) prevents UpdateSettings from disabling
+	// interception and clearing the queue between the check and the
+	// registration. The lock is released before blocking below.
+	// Check the settings and register the request in the queue atomically:
+	// holding setMu (shared) prevents UpdateSettings from disabling
+	// interception and clearing the queue between the check and the
+	// registration. The lock is released before blocking below.
 	ch := make(chan *http.Request)
 	done := make(chan struct{})
+	intercepted := true
 
-	svc.reqMu.Lock()
-	svc.requests[reqID] = Request{
-		req:  req,
-		ch:   ch,
-		done: done,
+	registerErr := func() error {
+		svc.setMu.RLock()
+		defer svc.setMu.RUnlock()
+
+		if !svc.requestsEnabled {
+			// If request intercept is disabled, return the incoming request as-is.
+			svc.logger.Debugw("Bypassed request interception: feature disabled.")
+			intercepted = false
+			return nil
+		}
+
+		if svc.reqFilter != nil {
+			match, err := MatchRequestFilter(req, svc.reqFilter)
+			if err != nil {
+				return fmt.Errorf("intercept: failed to match request rules for request (id: %v): %w",
+					reqID.String(), err,
+				)
+			}
+
+			if !match {
+				svc.logger.Debugw("Bypassed request interception: request rules don't match.")
+				intercepted = false
+				return nil
+			}
+		}
+
+		svc.reqMu.Lock()
+		svc.requests[reqID] = Request{
+			req:  req,
+			ch:   ch,
+			done: done,
+		}
+		svc.reqMu.Unlock()
+
+		return nil
+	}()
+
+	if registerErr != nil {
+		return nil, registerErr
 	}
-	svc.reqMu.Unlock()
+
+	if !intercepted {
+		return req, nil
+	}
 
 	// Whatever happens next (modified request returned, or a context cancelled error), any blocked channel senders
 	// should be unblocked, and the request should be removed from the requests queue.
@@ -210,7 +263,16 @@ func (svc *Service) CancelRequest(reqID ulid.ULID) error {
 	return svc.ModifyRequest(reqID, nil, nil)
 }
 
+// ClearRequests aborts all pending intercepted requests. It's safe for
+// concurrent use.
 func (svc *Service) ClearRequests() {
+	svc.setMu.Lock()
+	defer svc.setMu.Unlock()
+
+	svc.clearRequestsLocked()
+}
+
+func (svc *Service) clearRequestsLocked() {
 	svc.reqMu.Lock()
 	defer svc.reqMu.Unlock()
 
@@ -222,7 +284,16 @@ func (svc *Service) ClearRequests() {
 	}
 }
 
+// ClearResponses aborts all pending intercepted responses. It's safe for
+// concurrent use.
 func (svc *Service) ClearResponses() {
+	svc.setMu.Lock()
+	defer svc.setMu.Unlock()
+
+	svc.clearResponsesLocked()
+}
+
+func (svc *Service) clearResponsesLocked() {
 	svc.resMu.Lock()
 	defer svc.resMu.Unlock()
 
@@ -273,15 +344,21 @@ func (svc *Service) Items() []Item {
 	return items
 }
 
+// UpdateSettings atomically replaces the interception settings. When
+// interception is disabled, any requests/responses that were pending in the
+// queue under the old settings are aborted.
 func (svc *Service) UpdateSettings(settings Settings) {
+	svc.setMu.Lock()
+	defer svc.setMu.Unlock()
+
 	// When updating from requests `enabled` -> `disabled`, clear any pending reqs.
 	if svc.requestsEnabled && !settings.RequestsEnabled {
-		svc.ClearRequests()
+		svc.clearRequestsLocked()
 	}
 
 	// When updating from responses `enabled` -> `disabled`, clear any pending responses.
 	if svc.responsesEnabled && !settings.ResponsesEnabled {
-		svc.ClearResponses()
+		svc.clearResponsesLocked()
 	}
 
 	svc.requestsEnabled = settings.RequestsEnabled
@@ -364,43 +441,64 @@ func (svc *Service) InterceptResponse(ctx context.Context, res *http.Response) (
 		return res, nil
 	}
 
-	shouldIntercept, ok := ShouldInterceptResponseFromContext(ctx)
-	if ok && !shouldIntercept {
-		// If the related request explicitly disabled response intercept, return the response as-is.
-		svc.logger.Debugw("Bypassed response interception: related request explicitly disabled response intercept.")
-		return res, nil
-	}
-
-	// If global response intercept is disabled and interception is *not* explicitly enabled for this response: bypass.
-	if !svc.responsesEnabled && !(ok && shouldIntercept) {
-		svc.logger.Debugw("Bypassed response interception: feature disabled.")
-		return res, nil
-	}
-
-	if svc.resFilter != nil {
-		match, err := MatchResponseFilter(res, svc.resFilter)
-		if err != nil {
-			return nil, fmt.Errorf("intercept: failed to match response rules for response (id: %v): %w",
-				reqID.String(), err,
-			)
-		}
-
-		if !match {
-			svc.logger.Debugw("Bypassed response interception: response rules don't match.")
-			return res, nil
-		}
-	}
-
+	// Check the settings and register the response in the queue atomically
+	// (see InterceptRequest for the same rationale).
 	ch := make(chan *http.Response)
 	done := make(chan struct{})
+	intercepted := true
 
-	svc.resMu.Lock()
-	svc.responses[reqID] = Response{
-		res:  res,
-		ch:   ch,
-		done: done,
+	registerErr := func() error {
+		svc.setMu.RLock()
+		defer svc.setMu.RUnlock()
+
+		shouldIntercept, ok := ShouldInterceptResponseFromContext(ctx)
+		if ok && !shouldIntercept {
+			// If the related request explicitly disabled response intercept, return the response as-is.
+			svc.logger.Debugw("Bypassed response interception: related request explicitly disabled response intercept.")
+			intercepted = false
+			return nil
+		}
+
+		// If global response intercept is disabled and interception is *not* explicitly enabled for this response: bypass.
+		if !svc.responsesEnabled && !(ok && shouldIntercept) {
+			svc.logger.Debugw("Bypassed response interception: feature disabled.")
+			intercepted = false
+			return nil
+		}
+
+		if svc.resFilter != nil {
+			match, err := MatchResponseFilter(res, svc.resFilter)
+			if err != nil {
+				return fmt.Errorf("intercept: failed to match response rules for response (id: %v): %w",
+					reqID.String(), err,
+				)
+			}
+
+			if !match {
+				svc.logger.Debugw("Bypassed response interception: response rules don't match.")
+				intercepted = false
+				return nil
+			}
+		}
+
+		svc.resMu.Lock()
+		svc.responses[reqID] = Response{
+			res:  res,
+			ch:   ch,
+			done: done,
+		}
+		svc.resMu.Unlock()
+
+		return nil
+	}()
+
+	if registerErr != nil {
+		return nil, registerErr
 	}
-	svc.resMu.Unlock()
+
+	if !intercepted {
+		return res, nil
+	}
 
 	// Whatever happens next (modified response returned, or a context cancelled error), any blocked channel senders
 	// should be unblocked, and the response should be removed from the responses queue.

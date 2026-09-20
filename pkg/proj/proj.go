@@ -18,17 +18,23 @@ import (
 	"github.com/dstotijn/hetty/pkg/sender"
 )
 
+// defaultCloseTimeout bounds how long CloseProject/OpenProject wait for
+// in-flight proxied and sender requests to finish before resetting the
+// subservices anyway.
+const defaultCloseTimeout = 10 * time.Second
+
 //nolint:gosec
 var ulidEntropy = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 type Service struct {
-	repo            Repository
-	interceptSvc    *intercept.Service
-	reqLogSvc       *reqlog.Service
-	senderSvc       *sender.Service
-	scope           *scope.Scope
-	activeProjectID ulid.ULID
+	repo         Repository
+	interceptSvc *intercept.Service
+	reqLogSvc    *reqlog.Service
+	senderSvc    *sender.Service
+	scope        *scope.Scope
+
 	mu              sync.RWMutex
+	activeProjectID ulid.ULID
 }
 
 type Project struct {
@@ -60,10 +66,11 @@ type Settings struct {
 }
 
 var (
-	ErrProjectNotFound = errors.New("proj: project not found")
-	ErrNoProject       = errors.New("proj: no open project")
-	ErrNoSettings      = errors.New("proj: settings not found")
-	ErrInvalidName     = errors.New("proj: invalid name, must be alphanumeric or whitespace chars")
+	ErrProjectNotFound  = errors.New("proj: project not found")
+	ErrNoProject        = errors.New("proj: no open project")
+	ErrNoSettings       = errors.New("proj: settings not found")
+	ErrInvalidName      = errors.New("proj: invalid name, must be alphanumeric or whitespace chars")
+	ErrCloseProjectWait = errors.New("proj: timed out waiting for in-flight requests while closing project")
 )
 
 var nameRegexp = regexp.MustCompile(`^[\w\d\s]+$`)
@@ -105,35 +112,88 @@ func (svc *Service) CreateProject(ctx context.Context, name string) (Project, er
 	return project, nil
 }
 
-// CloseProject closes the currently open project (if there is one).
-func (svc *Service) CloseProject() error {
+// CloseProject closes the currently open project (if there is one). It
+// gracefully drains in-flight proxied and sender requests: pending
+// interceptions are aborted, new requests are rejected, and it waits (up to
+// defaultCloseTimeout, or until ctx is cancelled) for in-flight work to
+// finish before resetting the subservices to an empty state.
+func (svc *Service) CloseProject(ctx context.Context) error {
 	svc.mu.Lock()
 	defer svc.mu.Unlock()
 
+	return svc.closeProjectLocked(ctx)
+}
+
+// closeProjectLocked performs the graceful close. The caller must hold
+// svc.mu for writing.
+func (svc *Service) closeProjectLocked(ctx context.Context) error {
 	if svc.activeProjectID.Compare(ulid.ULID{}) == 0 {
 		return nil
 	}
 
 	svc.activeProjectID = ulid.ULID{}
-	svc.reqLogSvc.SetActiveProjectID(ulid.ULID{})
-	svc.reqLogSvc.SetBypassOutOfScopeRequests(false)
-	svc.reqLogSvc.SetFindReqsFilter(reqlog.FindRequestsFilter{})
+
+	// Stop accepting new proxied/sender requests and abort any pending
+	// interceptions, unblocking requests that are waiting for user action.
+	svc.reqLogSvc.BeginDrain()
+	svc.senderSvc.BeginDrain()
 	svc.interceptSvc.UpdateSettings(intercept.Settings{
 		RequestsEnabled:  false,
 		ResponsesEnabled: false,
 		RequestFilter:    nil,
 		ResponseFilter:   nil,
 	})
+
+	// Give in-flight requests a bounded amount of time to finish storing
+	// their logs, and cancel early when the caller's context is done.
+	waitCtx, cancel := context.WithTimeout(ctx, defaultCloseTimeout)
+	defer cancel()
+
+	stop := waitCtx.Done()
+
+	// Wait for both subservices concurrently: a sender request may depend on
+	// request log lookup and vice versa, so waiting sequentially could
+	// deadlock.
+	var reqLogDrained, senderDrained bool
+
+	var drainWg sync.WaitGroup
+	drainWg.Add(2)
+
+	go func() {
+		defer drainWg.Done()
+		reqLogDrained = svc.reqLogSvc.WaitFor(stop)
+	}()
+
+	go func() {
+		defer drainWg.Done()
+		senderDrained = svc.senderSvc.WaitFor(stop)
+	}()
+
+	drainWg.Wait()
+
+	// Reset all subservices to an empty project state regardless of whether
+	// the drain completed, so the service never ends up half-closed.
+	svc.reqLogSvc.SetActiveProjectID(ulid.ULID{})
+	svc.reqLogSvc.SetBypassOutOfScopeRequests(false)
+	svc.reqLogSvc.SetFindReqsFilter(reqlog.FindRequestsFilter{})
 	svc.senderSvc.SetActiveProjectID(ulid.ULID{})
 	svc.senderSvc.SetFindReqsFilter(sender.FindRequestsFilter{})
 	svc.scope.SetRules(nil)
+
+	if !reqLogDrained || !senderDrained {
+		return fmt.Errorf("%w: %v", ErrCloseProjectWait, waitCtx.Err())
+	}
 
 	return nil
 }
 
 // DeleteProject removes a project from the repository.
 func (svc *Service) DeleteProject(ctx context.Context, projectID ulid.ULID) error {
-	if svc.activeProjectID.Compare(projectID) == 0 {
+	svc.mu.RLock()
+	activeProjectID := svc.activeProjectID
+	svc.mu.RUnlock()
+
+	if activeProjectID.Compare(projectID) == 0 {
 		return fmt.Errorf("proj: project (%v) is active", projectID.String())
 	}
 
@@ -144,10 +204,18 @@ func (svc *Service) DeleteProject(ctx context.Context, projectID ulid.ULID) erro
 	return nil
 }
 
-// OpenProject sets a project as the currently active project.
+// OpenProject sets a project as the currently active project. When another
+// project is currently open, it is closed gracefully first (see
+// CloseProject).
 func (svc *Service) OpenProject(ctx context.Context, projectID ulid.ULID) (Project, error) {
 	svc.mu.Lock()
 	defer svc.mu.Unlock()
+
+	if svc.activeProjectID.Compare(ulid.ULID{}) != 0 {
+		if err := svc.closeProjectLocked(ctx); err != nil {
+			return Project{}, err
+		}
+	}
 
 	project, err := svc.repo.FindProjectByID(ctx, projectID)
 	if err != nil {
@@ -187,13 +255,37 @@ func (svc *Service) OpenProject(ctx context.Context, projectID ulid.ULID) (Proje
 	return project, nil
 }
 
+// ActiveProject returns the currently active project. It holds the service's
+// read lock for the whole lookup, so a concurrent CloseProject/OpenProject
+// cannot clear the active project ID in between reading the ID and fetching
+// the project.
 func (svc *Service) ActiveProject(ctx context.Context) (Project, error) {
-	activeProjectID := svc.activeProjectID
-	if activeProjectID.Compare(ulid.ULID{}) == 0 {
+	svc.mu.RLock()
+	defer svc.mu.RUnlock()
+
+	if svc.activeProjectID.Compare(ulid.ULID{}) == 0 {
 		return Project{}, ErrNoProject
 	}
 
-	project, err := svc.repo.FindProjectByID(ctx, activeProjectID)
+	project, err := svc.repo.FindProjectByID(ctx, svc.activeProjectID)
+	if err != nil {
+		return Project{}, fmt.Errorf("proj: failed to get active project: %w", err)
+	}
+
+	project.isActive = true
+
+	return project, nil
+}
+
+// activeProjectLocked returns the active project under the caller's lock
+// (write or read). Settings updates use it together with UpsertProject while
+// holding the write lock, making each read-modify-write cycle atomic.
+func (svc *Service) activeProjectLocked(ctx context.Context) (Project, error) {
+	if svc.activeProjectID.Compare(ulid.ULID{}) == 0 {
+		return Project{}, ErrNoProject
+	}
+
+	project, err := svc.repo.FindProjectByID(ctx, svc.activeProjectID)
 	if err != nil {
 		return Project{}, fmt.Errorf("proj: failed to get active project: %w", err)
 	}
@@ -217,7 +309,10 @@ func (svc *Service) Scope() *scope.Scope {
 }
 
 func (svc *Service) SetScopeRules(ctx context.Context, rules []scope.Rule) error {
-	project, err := svc.ActiveProject(ctx)
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
+	project, err := svc.activeProjectLocked(ctx)
 	if err != nil {
 		return err
 	}
@@ -235,7 +330,10 @@ func (svc *Service) SetScopeRules(ctx context.Context, rules []scope.Rule) error
 }
 
 func (svc *Service) SetRequestLogFindFilter(ctx context.Context, filter reqlog.FindRequestsFilter) error {
-	project, err := svc.ActiveProject(ctx)
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
+	project, err := svc.activeProjectLocked(ctx)
 	if err != nil {
 		return err
 	}
@@ -256,7 +354,10 @@ func (svc *Service) SetRequestLogFindFilter(ctx context.Context, filter reqlog.F
 }
 
 func (svc *Service) SetSenderRequestFindFilter(ctx context.Context, filter sender.FindRequestsFilter) error {
-	project, err := svc.ActiveProject(ctx)
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
+	project, err := svc.activeProjectLocked(ctx)
 	if err != nil {
 		return err
 	}
@@ -264,6 +365,7 @@ func (svc *Service) SetSenderRequestFindFilter(ctx context.Context, filter sende
 	filter.ProjectID = project.ID
 
 	project.Settings.SenderOnlyFindInScope = filter.OnlyInScope
+
 	project.Settings.SenderSearchExpr = filter.SearchExpr
 
 	err = svc.repo.UpsertProject(ctx, project)
@@ -277,11 +379,17 @@ func (svc *Service) SetSenderRequestFindFilter(ctx context.Context, filter sende
 }
 
 func (svc *Service) IsProjectActive(projectID ulid.ULID) bool {
+	svc.mu.RLock()
+	defer svc.mu.RUnlock()
+
 	return projectID.Compare(svc.activeProjectID) == 0
 }
 
 func (svc *Service) UpdateInterceptSettings(ctx context.Context, settings intercept.Settings) error {
-	project, err := svc.ActiveProject(ctx)
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
+	project, err := svc.activeProjectLocked(ctx)
 	if err != nil {
 		return err
 	}
