@@ -18,8 +18,19 @@ import (
 	"github.com/dstotijn/hetty/pkg/sender"
 )
 
-//nolint:gosec
-var ulidEntropy = rand.New(rand.NewSource(time.Now().UnixNano()))
+var (
+	//nolint:gosec
+	ulidEntropy  = rand.New(rand.NewSource(time.Now().UnixNano()))
+	ulidEntropyM sync.Mutex
+)
+
+// newULID returns a new ULID. It's safe for concurrent use.
+func newULID() ulid.ULID {
+	ulidEntropyM.Lock()
+	defer ulidEntropyM.Unlock()
+
+	return ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
+}
 
 type Service struct {
 	repo            Repository
@@ -93,7 +104,7 @@ func (svc *Service) CreateProject(ctx context.Context, name string) (Project, er
 	}
 
 	project := Project{
-		ID:   ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy),
+		ID:   newULID(),
 		Name: name,
 	}
 
@@ -115,15 +126,24 @@ func (svc *Service) CloseProject() error {
 	}
 
 	svc.activeProjectID = ulid.ULID{}
-	svc.reqLogSvc.SetActiveProjectID(ulid.ULID{})
-	svc.reqLogSvc.SetBypassOutOfScopeRequests(false)
-	svc.reqLogSvc.SetFindReqsFilter(reqlog.FindRequestsFilter{})
+
+	// Disable intercepting first. This aborts any pending intercepted
+	// requests and responses, unblocking their handlers.
 	svc.interceptSvc.UpdateSettings(intercept.Settings{
 		RequestsEnabled:  false,
 		ResponsesEnabled: false,
 		RequestFilter:    nil,
 		ResponseFilter:   nil,
 	})
+
+	// Wait for in-flight intercepted requests and responses to finish, so
+	// the remaining sub-services aren't reset while requests are still
+	// being handled.
+	svc.interceptSvc.Wait()
+
+	svc.reqLogSvc.SetActiveProjectID(ulid.ULID{})
+	svc.reqLogSvc.SetBypassOutOfScopeRequests(false)
+	svc.reqLogSvc.SetFindReqsFilter(reqlog.FindRequestsFilter{})
 	svc.senderSvc.SetActiveProjectID(ulid.ULID{})
 	svc.senderSvc.SetFindReqsFilter(sender.FindRequestsFilter{})
 	svc.scope.SetRules(nil)
@@ -133,6 +153,9 @@ func (svc *Service) CloseProject() error {
 
 // DeleteProject removes a project from the repository.
 func (svc *Service) DeleteProject(ctx context.Context, projectID ulid.ULID) error {
+	svc.mu.RLock()
+	defer svc.mu.RUnlock()
+
 	if svc.activeProjectID.Compare(projectID) == 0 {
 		return fmt.Errorf("proj: project (%v) is active", projectID.String())
 	}
@@ -188,12 +211,21 @@ func (svc *Service) OpenProject(ctx context.Context, projectID ulid.ULID) (Proje
 }
 
 func (svc *Service) ActiveProject(ctx context.Context) (Project, error) {
-	activeProjectID := svc.activeProjectID
-	if activeProjectID.Compare(ulid.ULID{}) == 0 {
+	svc.mu.RLock()
+	defer svc.mu.RUnlock()
+
+	return svc.activeProject(ctx)
+}
+
+// activeProject returns the currently active project. Callers must hold at
+// least a read lock on svc.mu, so the active project can't change (e.g. by a
+// concurrent CloseProject) while it's being fetched.
+func (svc *Service) activeProject(ctx context.Context) (Project, error) {
+	if svc.activeProjectID.Compare(ulid.ULID{}) == 0 {
 		return Project{}, ErrNoProject
 	}
 
-	project, err := svc.repo.FindProjectByID(ctx, activeProjectID)
+	project, err := svc.repo.FindProjectByID(ctx, svc.activeProjectID)
 	if err != nil {
 		return Project{}, fmt.Errorf("proj: failed to get active project: %w", err)
 	}
@@ -217,7 +249,10 @@ func (svc *Service) Scope() *scope.Scope {
 }
 
 func (svc *Service) SetScopeRules(ctx context.Context, rules []scope.Rule) error {
-	project, err := svc.ActiveProject(ctx)
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
+	project, err := svc.activeProject(ctx)
 	if err != nil {
 		return err
 	}
@@ -235,7 +270,10 @@ func (svc *Service) SetScopeRules(ctx context.Context, rules []scope.Rule) error
 }
 
 func (svc *Service) SetRequestLogFindFilter(ctx context.Context, filter reqlog.FindRequestsFilter) error {
-	project, err := svc.ActiveProject(ctx)
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
+	project, err := svc.activeProject(ctx)
 	if err != nil {
 		return err
 	}
@@ -256,7 +294,10 @@ func (svc *Service) SetRequestLogFindFilter(ctx context.Context, filter reqlog.F
 }
 
 func (svc *Service) SetSenderRequestFindFilter(ctx context.Context, filter sender.FindRequestsFilter) error {
-	project, err := svc.ActiveProject(ctx)
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
+	project, err := svc.activeProject(ctx)
 	if err != nil {
 		return err
 	}
@@ -277,11 +318,17 @@ func (svc *Service) SetSenderRequestFindFilter(ctx context.Context, filter sende
 }
 
 func (svc *Service) IsProjectActive(projectID ulid.ULID) bool {
+	svc.mu.RLock()
+	defer svc.mu.RUnlock()
+
 	return projectID.Compare(svc.activeProjectID) == 0
 }
 
 func (svc *Service) UpdateInterceptSettings(ctx context.Context, settings intercept.Settings) error {
-	project, err := svc.ActiveProject(ctx)
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
+	project, err := svc.activeProject(ctx)
 	if err != nil {
 		return err
 	}

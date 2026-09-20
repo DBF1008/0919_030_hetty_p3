@@ -17,8 +17,25 @@ import (
 	"github.com/dstotijn/hetty/pkg/proxy/intercept"
 )
 
-//nolint:gosec
-var ulidEntropy = rand.New(rand.NewSource(time.Now().UnixNano()))
+var ulidEntropy = newLockedEntropy()
+
+// lockedEntropy is an entropy source that's safe for concurrent use.
+type lockedEntropy struct {
+	mu sync.Mutex
+	r  *rand.Rand
+}
+
+func newLockedEntropy() *lockedEntropy {
+	//nolint:gosec
+	return &lockedEntropy{r: rand.New(rand.NewSource(time.Now().UnixNano()))}
+}
+
+func (e *lockedEntropy) Read(p []byte) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.r.Read(p)
+}
 
 func TestRequestModifier(t *testing.T) {
 	t.Parallel()
@@ -71,8 +88,11 @@ func TestRequestModifier(t *testing.T) {
 		modReq.Header.Set("X-Foo", "bar")
 
 		err := svc.ModifyRequest(reqID, modReq, nil)
-		if !errors.Is(err, intercept.ErrRequestDone) {
-			t.Fatalf("expected `intercept.ErrRequestDone`, got: %v", err)
+		// Depending on whether the modifier goroutine already removed the
+		// cancelled request from the queue, either error can be returned;
+		// both mean the request is no longer modifiable.
+		if !errors.Is(err, intercept.ErrRequestDone) && !errors.Is(err, intercept.ErrRequestNotFound) {
+			t.Fatalf("expected `intercept.ErrRequestDone` or `intercept.ErrRequestNotFound`, got: %v", err)
 		}
 	})
 
@@ -195,8 +215,11 @@ func TestResponseModifier(t *testing.T) {
 		modRes.Header.Set("X-Foo", "bar")
 
 		err := svc.ModifyResponse(reqID, &modRes)
-		if !errors.Is(err, intercept.ErrRequestDone) {
-			t.Fatalf("expected `intercept.ErrRequestDone`, got: %v", err)
+		// Depending on whether the modifier goroutine already removed the
+		// cancelled response from the queue, either error can be returned;
+		// both mean the response is no longer modifiable.
+		if !errors.Is(err, intercept.ErrRequestDone) && !errors.Is(err, intercept.ErrRequestNotFound) {
+			t.Fatalf("expected `intercept.ErrRequestDone` or `intercept.ErrRequestNotFound`, got: %v", err)
 		}
 
 		wg.Wait()

@@ -54,10 +54,15 @@ type Service struct {
 	responses map[ulid.ULID]Response
 	logger    log.Logger
 
+	settingsMu       sync.RWMutex
 	requestsEnabled  bool
 	responsesEnabled bool
 	reqFilter        filter.Expression
 	resFilter        filter.Expression
+
+	// pending tracks in-flight intercepted requests and responses, so they
+	// can be gracefully drained (see Wait).
+	pending sync.WaitGroup
 }
 
 type Config struct {
@@ -129,14 +134,28 @@ func (svc *Service) InterceptRequest(ctx context.Context, req *http.Request) (*h
 		return req, nil
 	}
 
+	// Check (and register as pending) while holding the settings lock, so
+	// `Wait` can't return while a request is about to be intercepted.
+	svc.settingsMu.RLock()
+
 	if !svc.requestsEnabled {
+		svc.settingsMu.RUnlock()
+
 		// If request intercept is disabled, return the incoming request as-is.
 		svc.logger.Debugw("Bypassed request interception: feature disabled.")
+
 		return req, nil
 	}
 
-	if svc.reqFilter != nil {
-		match, err := MatchRequestFilter(req, svc.reqFilter)
+	reqFilter := svc.reqFilter
+
+	svc.pending.Add(1)
+	svc.settingsMu.RUnlock()
+
+	defer svc.pending.Done()
+
+	if reqFilter != nil {
+		match, err := MatchRequestFilter(req, reqFilter)
 		if err != nil {
 			return nil, fmt.Errorf("intercept: failed to match request rules for request (id: %v): %w",
 				reqID.String(), err,
@@ -274,20 +293,32 @@ func (svc *Service) Items() []Item {
 }
 
 func (svc *Service) UpdateSettings(settings Settings) {
-	// When updating from requests `enabled` -> `disabled`, clear any pending reqs.
-	if svc.requestsEnabled && !settings.RequestsEnabled {
-		svc.ClearRequests()
-	}
-
-	// When updating from responses `enabled` -> `disabled`, clear any pending responses.
-	if svc.responsesEnabled && !settings.ResponsesEnabled {
-		svc.ClearResponses()
-	}
-
+	svc.settingsMu.Lock()
+	clearReqs := svc.requestsEnabled && !settings.RequestsEnabled
+	clearResps := svc.responsesEnabled && !settings.ResponsesEnabled
 	svc.requestsEnabled = settings.RequestsEnabled
 	svc.responsesEnabled = settings.ResponsesEnabled
 	svc.reqFilter = settings.RequestFilter
 	svc.resFilter = settings.ResponseFilter
+	svc.settingsMu.Unlock()
+
+	// When updating from requests `enabled` -> `disabled`, clear any pending reqs.
+	if clearReqs {
+		svc.ClearRequests()
+	}
+
+	// When updating from responses `enabled` -> `disabled`, clear any pending responses.
+	if clearResps {
+		svc.ClearResponses()
+	}
+}
+
+// Wait blocks until all in-flight intercepted requests and responses have
+// been handled. It's typically called after interception has been disabled
+// via UpdateSettings (which aborts pending items), to gracefully drain
+// in-flight requests before tearing down related state.
+func (svc *Service) Wait() {
+	svc.pending.Wait()
 }
 
 // ItemByID returns an intercepted item (request and possible response) by ID. It's safe for concurrent use.
@@ -371,14 +402,28 @@ func (svc *Service) InterceptResponse(ctx context.Context, res *http.Response) (
 		return res, nil
 	}
 
+	svc.settingsMu.RLock()
+	responsesEnabled := svc.responsesEnabled
+	resFilter := svc.resFilter
+
 	// If global response intercept is disabled and interception is *not* explicitly enabled for this response: bypass.
-	if !svc.responsesEnabled && !(ok && shouldIntercept) {
+	intercept := responsesEnabled || (ok && shouldIntercept)
+	if intercept {
+		// Register as pending while holding the settings lock, so `Wait`
+		// can't return while a response is about to be intercepted.
+		svc.pending.Add(1)
+	}
+	svc.settingsMu.RUnlock()
+
+	if !intercept {
 		svc.logger.Debugw("Bypassed response interception: feature disabled.")
 		return res, nil
 	}
 
-	if svc.resFilter != nil {
-		match, err := MatchResponseFilter(res, svc.resFilter)
+	defer svc.pending.Done()
+
+	if resFilter != nil {
+		match, err := MatchResponseFilter(res, resFilter)
 		if err != nil {
 			return nil, fmt.Errorf("intercept: failed to match response rules for response (id: %v): %w",
 				reqID.String(), err,
